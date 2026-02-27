@@ -5,6 +5,14 @@ export type TgvRow = {
 
   wikiGroup: string;
   serieLabel: string;
+
+  // Champs "bruts" extraits des colonnes Wikipédia (peuvent être vides selon les tableaux)
+  typeRaw: string;
+  miseEnServiceRaw: string;
+  radiationRemarqueRaw: string;
+  livreeRaw: string;
+  stfTitulaireRaw: string;
+  baptemeRaw: string;
   etatRaw: string;
 
   status: "ACTIVE" | "HISTORICAL" | "UNKNOWN";
