@@ -1,0 +1,55 @@
+name: Daily TGV dataset update
+
+on:
+  schedule:
+    - cron: "15 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-dataset:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Update TGV dataset
+        run: npm run data:tgv:update
+
+      - name: Validate TGV dataset
+        run: npm run data:tgv:validate
+
+      - name: Commit changes if needed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git add public/data/tgv_map.json public/data/tgv_map.csv public/data/tgv_issues.csv
+
+          if git diff --cached --quiet; then
+            echo "No dataset changes to commit."
+            exit 0
+          fi
+
+          git commit -m "chore(data): daily TGV dataset update"
+          git push
