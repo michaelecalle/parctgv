@@ -7,7 +7,10 @@ type Row = {
   motriceA: string;
   motriceB: string;
   confidence: string;
-  serie: string;
+
+  // présent dans le JSON généré (selon versions)
+  serie?: string;
+  wikiGroup?: string;
 };
 
 function readJson(): Row[] {
@@ -53,6 +56,33 @@ function main() {
 
   // On ne fail pas automatiquement (historiquement il peut y avoir des cas spéciaux),
   // mais on peut durcir plus tard.
+
+  // Checks "métier" (warnings) : s'assurer qu'on extrait bien les motrices sur certains groupes
+  const g600 = rows.filter((r) => (r.wikiGroup ?? "").startsWith("Rames 600"));
+  const g4500 = rows.filter((r) => (r.wikiGroup ?? "").startsWith("Rames 4500"));
+
+  const bad600 = g600.filter((r) => !r.motriceA || !r.motriceB);
+  const bad4500 = g4500.filter((r) => !r.motriceA || !r.motriceB);
+
+  if (g600.length && bad600.length) {
+    console.log(
+      `[WARN] Rames 600: ${bad600.length}/${g600.length} lignes sans 2 motrices (colonne possiblement mauvaise).`
+    );
+    console.log(
+      "Exemples:",
+      bad600.slice(0, 5).map((r) => [r.rame, r.motriceA, r.motriceB])
+    );
+  }
+
+  if (g4500.length && bad4500.length) {
+    console.log(
+      `[WARN] Rames 4500: ${bad4500.length}/${g4500.length} lignes sans 2 motrices (parsing a fiabiliser).`
+    );
+    console.log(
+      "Exemples:",
+      bad4500.slice(0, 5).map((r) => [r.rame, r.motriceA, r.motriceB])
+    );
+  }
 }
 
 main();

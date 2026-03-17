@@ -16,25 +16,35 @@ type Row = {
   // Série métier (ex: "TGV Euroduplex (2N2)")
   serieLabel: string;
 
-  // Sous-série / type si présent (ex: "3UH", "3UF", "3UA"...)
-  typeRaw: string;
+  // Sous-série / type si présent
+  typeRaw?: string;
 
-  // Champs extra du tableau
-  miseEnServiceRaw: string;
-  radiationRemarqueRaw: string;
-  livreeRaw: string;
-  stfTitulaireRaw: string;
-  baptemeRaw: string;
+  // Baptême (si présent)
+  baptemeRaw?: string;
 
-  // Colonne "État/Statut" brute si elle existe (souvent absente)
-  etatRaw: string;
+  // Livrée (si présent)
+  livreeRaw?: string;
 
+  // STF (si présent)
+  stfTitulaireRaw?: string;
+
+  // Mise en service (si présent)
+  miseEnServiceRaw?: string;
+
+  // Radiation/remarque (colonne dédiée)
+  radiationRemarqueRaw?: string;
+
+  // Remarque extraite du champ motrices (cas ex: "ex-24013/24014")
+  remark?: string;
+
+  // Confidence : EXACT (2 motrices), PARTIAL (1 motrice), NONE (0)
+  confidence: "EXACT" | "PARTIAL" | "NONE";
+
+  // Statut métier (ACTIVE/HISTORICAL/UNKNOWN)
   status: SerieStatus;
 
-  confidence: "OK" | "PARTIAL" | "AMBIGUOUS";
-  remark: string;
-  source: string;
-  extractedAt: string; // ISO
+  // Timestamp extraction
+  extractedAt: string;
 };
 
 const WIKI_PAGE = "Liste_des_TGV";
@@ -49,12 +59,24 @@ function cleanText(s: string) {
   return (s ?? "").replace(/\s+/g, " ").trim();
 }
 
+// Supprime les refs Wikipédia [1], [12], etc. + normalise espaces/tirets
+function cleanWikiCellText(s: string) {
+  return cleanText(s)
+    .replace(/\[[^\]]*]/g, "") // refs [1]
+    .replace(/\u00A0/g, " ") // nbsp
+    .replace(/[–—]/g, "-") // tirets unicode
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function hasWord(h: string, w: string) {
+  return (` ${h} `).includes(` ${w} `);
+}
+
 // Ex: "24001/002" -> ["24001","24002"]
 // Ex: "28001 / 28002" -> ["28001","28002"]
 function expandMotrices(raw: string): { a?: string; b?: string; remark?: string } {
-  const t = cleanText(raw)
-    .replace(/[–—]/g, "-")
-    .replace(/\u00A0/g, " "); // nbsp
+  const t = cleanWikiCellText(raw);
 
   // extraire 2 nombres (avec possible forme abrégée après /)
   // cas 1: "310201/202"
@@ -72,117 +94,58 @@ function expandMotrices(raw: string): { a?: string; b?: string; remark?: string 
     return { a: left, b: right };
   }
 
-  // cas 2: "28001 28002" ou "28001-28002"
-  const nums = t.match(/\d{3,6}/g) ?? [];
-  if (nums.length >= 2) {
-    return { a: nums[0], b: nums[1] };
-  }
-  if (nums.length === 1) {
-    return { a: nums[0], b: "", remark: "Une seule motrice détectée" };
-  }
-  return { a: "", b: "", remark: "Aucune motrice détectée" };
+  // cas 2: "28001 - 28002" ou "28001–28002"
+  const m2 = t.match(/(\d{3,6})\s*[-]\s*(\d{3,6})/);
+  if (m2) return { a: m2[1], b: m2[2] };
+
+  // cas 3: 2 nombres simples dans la cellule (ex: "24001 24002")
+  const nums = [...t.matchAll(/\b(\d{3,6})\b/g)].map((x) => x[1]);
+  if (nums.length >= 2) return { a: nums[0], b: nums[1] };
+  if (nums.length === 1) return { a: nums[0] };
+
+  // cas 4: rien (ou "—", etc.)
+  // on conserve quand même le texte brut comme remarque éventuelle
+  const remark = t && t !== "-" ? t : undefined;
+  return { remark };
 }
 
-function tableLooksLikeRameMotrices($table: cheerio.Cheerio<any>, $: cheerio.CheerioAPI) {
-  const $headerRow = $table
-    .find("tr")
-    .filter((_, tr) => $(tr).find("th").length > 0)
-    .first();
-  if ($headerRow.length === 0) return false;
-
-  const headers = $headerRow
-    .find("th")
-    .map((_, th) => cleanText($(th).text()))
-    .get()
-    .join("|")
-    .toLowerCase();
-
-  return headers.includes("rame") && headers.includes("motrice");
-}
-
-function normalizeWikiGroupTitle(s: string): string {
-  // enlève les références [4], [19], etc.
-  return cleanText(s.replace(/\[[^\]]*]/g, ""));
-}
-
-function applySerieMapping(wikiGroupTitle: string): { serieLabel: string; status: SerieStatus } {
-  const t = normalizeWikiGroupTitle(wikiGroupTitle);
-  const entry = SERIE_MAPPING.find((e) => t.startsWith(e.groupPrefix));
-  if (!entry) return { serieLabel: "Inconnu", status: "UNKNOWN" };
-  return { serieLabel: entry.serieLabel, status: entry.status };
-}
-
-function headerKey(h: string) {
-  // normalisation pour matcher facilement les variantes ("titulaire", "STF", accents, etc.)
-  return cleanText(h)
+function headerKey(s: string) {
+  return cleanText(s)
     .toLowerCase()
-    .replace(/\u00A0/g, " ")
     .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, ""); // supprime accents
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
 }
 
-async function main() {
-  const extractedAt = nowIso();
-  const url = `${WIKI_API}&page=${encodeURIComponent(WIKI_PAGE)}`;
+function wikiGroupTitle(raw: string) {
+  return cleanText(raw).replace(/\[[^\]]*]/g, "").trim();
+}
 
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
-
-  const res = await fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timeout));
-  if (!res.ok) throw new Error(`HTTP ${res.status} on ${url}`);
-  const data: any = await res.json();
-
-  const html = data?.parse?.text?.["*"];
-  if (!html) throw new Error("Impossible de récupérer le HTML parsé depuis l'API MediaWiki.");
-
+function parseTableToRows(html: string) {
   const $ = cheerio.load(html);
-  const $tables = $("table.wikitable");
 
-  const rows: Row[] = [];
-  const issues: Row[] = [];
+  const out: Row[] = [];
 
-  function inferWikiGroupForTable(tableEl: any): string {
-    const $t = $(tableEl);
+  // Les tableaux wikitable "Liste des TGV"
+  const tables = $(".wikitable");
 
-    const caption = cleanText($t.find("caption").first().text());
-    if (caption) return caption;
+  tables.each((_, table) => {
+    const $table = $(table);
 
-    let $h = $t.prevAll("h2, h3").first();
-    if ($h.length) {
-      const headline = cleanText($h.find(".mw-headline").first().text() || $h.text());
-      return headline.replace(/\[modifier.*$/i, "").trim() || "Inconnu";
-    }
+    // titre du groupe = le <caption> si présent, sinon rien
+    const caption = wikiGroupTitle($table.find("caption").first().text());
+    const wikiGroup = caption || "Wikitable";
 
-    let $p = $t.parent();
-    for (let i = 0; i < 10 && $p.length; i++) {
-      $h = $p.prevAll("h2, h3").first();
-      if ($h.length) {
-        const headline = cleanText($h.find(".mw-headline").first().text() || $h.text());
-        return headline.replace(/\[modifier.*$/i, "").trim() || "Inconnu";
-      }
-      $p = $p.parent();
-    }
-
-    return "Inconnu";
-  }
-
-  $tables.each((_, tableEl) => {
-    const $table = $(tableEl);
-    if (!tableLooksLikeRameMotrices($table, $)) return;
-
-    const wikiGroup = inferWikiGroupForTable(tableEl);
-    const mapped = applySerieMapping(wikiGroup);
-
-    const $headerRow = $table
-      .find("tr")
-      .filter((_, tr) => $(tr).find("th").length > 0)
-      .first();
-    if ($headerRow.length === 0) return;
+    // Ligne header : la première ligne avec des <th>
+    const $headerRow = $table.find("tr").filter((__, tr) => $(tr).find("th").length > 0).first();
+    if (!$headerRow.length) return;
 
     const headerCells = $headerRow.find("th");
 
     let rameIdx = -1;
     let motIdx = -1;
+    let motScore = -999;
     let etatIdx = -1;
 
     let miseIdx = -1;
@@ -192,26 +155,47 @@ async function main() {
     let stfIdx = -1;
     let baptIdx = -1;
 
+    // ✅ support tableaux avec 2 colonnes (Motrice A / Motrice B)
+    let motAIdx = -1;
+    let motBIdx = -1;
+
     headerCells.each((i, th) => {
       const raw = cleanText($(th).text());
       const h = headerKey(raw);
 
       if (h.includes("rame")) rameIdx = i;
-      if (h.includes("motrice")) motIdx = i;
 
-      // colonne optionnelle déjà gérée
-      if (h.includes("etat") || h.includes("statut")) etatIdx = i;
+      // détecter explicitement Motrice A / Motrice B si présents
+      if (h.includes("motrice") && (h.endsWith(" a") || h.includes(" motrice a"))) motAIdx = i;
+      if (h.includes("motrice") && (h.endsWith(" b") || h.includes(" motrice b"))) motBIdx = i;
 
-      // nouvelles colonnes (variantes selon tableaux)
-      if (h.includes("mise en service")) miseIdx = i;
-      if (h.includes("radiation") || h.includes("remarque")) radIdx = i; // "Radiation" ou "Radiation ou remarque"
-      if (h === "type" || h.includes(" type")) typeIdx = i;
+      if (h.includes("motrice")) {
+        // On choisit la colonne "motrices" avec priorité, et on évite "origine"
+        const isOrigine = hasWord(h, "origine");
+        const isPlural = hasWord(h, "motrices");
+        const score = (isPlural ? 20 : 10) + (isOrigine ? -100 : 0);
+
+        if (score > motScore) {
+          motScore = score;
+          motIdx = i;
+        }
+      }
+
+      // colonne opti
+      if (h.includes("etat")) etatIdx = i;
+
+      // colonnes bonus (varient selon série)
+      if (h.includes("mise") && h.includes("service")) miseIdx = i;
+      if (h.includes("radiation") || (h.includes("remarque") && h.includes("radiation"))) radIdx = i;
+      if (h === "type" || (h.includes("type") && !h.includes("prototype"))) typeIdx = i;
       if (h.includes("livree")) livreeIdx = i;
-      if (h.includes("titulaire") || h === "stf" || h.includes(" stf")) stfIdx = i;
+      if (h.includes("stf")) stfIdx = i;
       if (h.includes("bapteme")) baptIdx = i;
     });
 
-    if (rameIdx === -1 || motIdx === -1) return;
+    // rame + motrices indispensables
+    // ✅ si Motrice A/B existent, on n'exige pas motIdx
+    if (rameIdx === -1 || (motIdx === -1 && (motAIdx === -1 || motBIdx === -1))) return;
 
     const $dataRows = $headerRow.nextAll("tr");
 
@@ -219,65 +203,159 @@ async function main() {
       const $cells = $(tr).find("td");
       if ($cells.length === 0) return;
 
-      const rame = cleanText($cells.eq(rameIdx).text());
-      const motRaw = cleanText($cells.eq(motIdx).text());
+      const rame = cleanWikiCellText($cells.eq(rameIdx).text());
       if (!rame) return;
 
-      const { a, b, remark } = expandMotrices(motRaw);
+      // ✅ Filtre anti-artefacts (ex: "/", "Rés.", etc.)
+      // On ne garde que les rames contenant au moins un chiffre.
+      const rameDigits = rame.replace(/\D/g, "");
+      if (!rameDigits) return;
 
-      const etatRaw = etatIdx >= 0 ? cleanText($cells.eq(etatIdx).text()) : "";
+      // ✅ si tableau A/B : on lit directement les 2 colonnes
+      // sinon : fallback sur parsing de la colonne "motrices"
+      let a: string | undefined;
+      let b: string | undefined;
+      let remark: string | undefined;
 
-      const miseEnServiceRaw = miseIdx >= 0 ? cleanText($cells.eq(miseIdx).text()) : "";
-      const radiationRemarqueRaw = radIdx >= 0 ? cleanText($cells.eq(radIdx).text()) : "";
-      const typeRaw = typeIdx >= 0 ? cleanText($cells.eq(typeIdx).text()) : "";
-      const livreeRaw = livreeIdx >= 0 ? cleanText($cells.eq(livreeIdx).text()) : "";
-      const stfTitulaireRaw = stfIdx >= 0 ? cleanText($cells.eq(stfIdx).text()) : "";
-      const baptemeRaw = baptIdx >= 0 ? cleanText($cells.eq(baptIdx).text()) : "";
+      if (motAIdx >= 0 && motBIdx >= 0) {
+        const rawA = cleanWikiCellText($cells.eq(motAIdx).text());
+        const rawB = cleanWikiCellText($cells.eq(motBIdx).text());
+        a = rawA.replace(/\D/g, "") || undefined;
+        b = rawB.replace(/\D/g, "") || undefined;
+      } else {
+        const motRaw = cleanWikiCellText($cells.eq(motIdx).text());
+        const parsed = expandMotrices(motRaw);
+        a = parsed.a;
+        b = parsed.b;
+        remark = parsed.remark;
+      }
 
-      const row: Row = {
+      const etatRaw = etatIdx >= 0 ? cleanWikiCellText($cells.eq(etatIdx).text()) : "";
+
+      const miseEnServiceRaw = miseIdx >= 0 ? cleanWikiCellText($cells.eq(miseIdx).text()) : undefined;
+      const radiationRemarqueRaw = radIdx >= 0 ? cleanWikiCellText($cells.eq(radIdx).text()) : undefined;
+      const typeRaw = typeIdx >= 0 ? cleanWikiCellText($cells.eq(typeIdx).text()) : undefined;
+      const livreeRaw = livreeIdx >= 0 ? cleanWikiCellText($cells.eq(livreeIdx).text()) : undefined;
+      const stfTitulaireRaw = stfIdx >= 0 ? cleanWikiCellText($cells.eq(stfIdx).text()) : undefined;
+      const baptemeRaw = baptIdx >= 0 ? cleanWikiCellText($cells.eq(baptIdx).text()) : undefined;
+
+      // mapping série à partir du nom du groupe
+      const mapping = SERIE_MAPPING.find((m) =>
+        wikiGroup.toLowerCase().startsWith((m.groupPrefix ?? "").toLowerCase())
+      );
+      const serieLabel = mapping?.serieLabel ?? wikiGroup;
+      const status: SerieStatus = mapping?.status ?? "UNKNOWN";
+
+      const confidence: Row["confidence"] = a && b ? "EXACT" : a ? "PARTIAL" : "NONE";
+
+      out.push({
         rame,
         motriceA: a ?? "",
         motriceB: b ?? "",
         wikiGroup,
-        serieLabel: mapped.serieLabel,
+        serieLabel,
+
         typeRaw,
-        miseEnServiceRaw,
-        radiationRemarqueRaw,
+        baptemeRaw,
         livreeRaw,
         stfTitulaireRaw,
-        baptemeRaw,
-        etatRaw,
-        status: mapped.status,
-        confidence: "OK",
-        remark: remark ?? "",
-        source: `wikipedia:${WIKI_PAGE}`,
-        extractedAt
-      };
+        miseEnServiceRaw,
+        radiationRemarqueRaw,
 
-      if (!row.motriceA || !row.motriceB) row.confidence = "PARTIAL";
-      if (row.remark) row.confidence = row.motriceA && row.motriceB ? "OK" : "PARTIAL";
-
-      const looksWeird = /[a-z]/i.test(motRaw) && !(row.motriceA && row.motriceB);
-      if (looksWeird || row.confidence !== "OK") issues.push(row);
-
-      rows.push(row);
+        remark,
+        confidence,
+        status,
+        extractedAt: nowIso()
+      });
     });
   });
 
+  return out;
+}
+
+async function fetchWikiHtml() {
+  const url = `${WIKI_API}&page=${encodeURIComponent(WIKI_PAGE)}`;
+
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Wiki fetch failed: ${r.status} ${r.statusText}`);
+
+  const j = await r.json();
+  const html = j?.parse?.text?.["*"];
+  if (!html) throw new Error("Wiki parse result missing html");
+
+  return html as string;
+}
+
+function writeOutputs(rows: Row[]) {
   const outDir = path.join(process.cwd(), "public", "data");
   fs.mkdirSync(outDir, { recursive: true });
 
-  const csv = Papa.unparse(rows, { quotes: false, delimiter: ";", newline: "\n" });
-  fs.writeFileSync(path.join(outDir, "tgv_map.csv"), csv, "utf-8");
+  // JSON
+  const jsonPath = path.join(outDir, "tgv_map.json");
+  fs.writeFileSync(jsonPath, JSON.stringify(rows, null, 2), "utf-8");
 
-  const issuesCsv = Papa.unparse(issues, { quotes: false, delimiter: ";", newline: "\n" });
-  fs.writeFileSync(path.join(outDir, "tgv_issues.csv"), issuesCsv, "utf-8");
+  // CSV (flat)
+  const csvPath = path.join(outDir, "tgv_map.csv");
+  const csv = Papa.unparse(
+    rows.map((r) => ({
+      rame: r.rame,
+      motriceA: r.motriceA,
+      motriceB: r.motriceB,
+      serieLabel: r.serieLabel,
+      type: r.typeRaw ?? "",
+      bapteme: r.baptemeRaw ?? "",
+      livree: r.livreeRaw ?? "",
+      stf: r.stfTitulaireRaw ?? "",
+      miseEnService: r.miseEnServiceRaw ?? "",
+      radiationRemarque: r.radiationRemarqueRaw ?? "",
+      remark: r.remark ?? "",
+      confidence: r.confidence,
+      status: r.status,
+      wikiGroup: r.wikiGroup,
+      extractedAt: r.extractedAt
+    })),
+    { quotes: true }
+  );
+  fs.writeFileSync(csvPath, csv, "utf-8");
 
-  fs.writeFileSync(path.join(outDir, "tgv_map.json"), JSON.stringify(rows, null, 2), "utf-8");
+  // Issues CSV
+  const issues: Array<{ type: string; rame: string; motrice: string; wikiGroup: string; note: string }> = [];
+
+  for (const r of rows) {
+    if (!r.rame) continue;
+    if (!r.motriceA || !r.motriceB) {
+      issues.push({
+        type: "MOTRICES_INCOMPLETE",
+        rame: r.rame,
+        motrice: `${r.motriceA || "?"}/${r.motriceB || "?"}`,
+        wikiGroup: r.wikiGroup,
+        note: r.remark ?? ""
+      });
+    }
+  }
+
+  const issuesPath = path.join(outDir, "tgv_issues.csv");
+  const issuesCsv = Papa.unparse(issues, { quotes: true });
+  fs.writeFileSync(issuesPath, issuesCsv, "utf-8");
 
   console.log(`OK: ${rows.length} lignes extraites`);
   console.log(`Issues: ${issues.length}`);
   console.log(`Écrit dans: public/data/`);
+}
+
+async function main() {
+  const html = await fetchWikiHtml();
+  const rows = parseTableToRows(html);
+
+  // tri par rame numérique si possible
+  rows.sort((a, b) => {
+    const na = parseInt(a.rame.replace(/\D/g, ""), 10);
+    const nb = parseInt(b.rame.replace(/\D/g, ""), 10);
+    if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+    return a.rame.localeCompare(b.rame);
+  });
+
+  writeOutputs(rows);
 }
 
 main().catch((e) => {
